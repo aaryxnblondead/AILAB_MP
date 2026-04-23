@@ -202,30 +202,19 @@ def _add_probability_outcomes(forecast_df: pd.DataFrame, n_sims: int) -> pd.Data
     return out
 
 
-def build_2026_all_driver_forecast(
+def _collect_training_raw(
     cache_dir: str,
-    target_year: int = 2026,
-    lookback_years: int = 5,
-    n_monte_carlo: int = 250,
-) -> dict[str, Any]:
-    """
-    Train on all available prior race data and predict all-driver future races.
+    target_year: int,
+    lookback_years: int,
+    focus_round: int | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Collect training frames using recent form + optional same-track history."""
+    completed_target, future_target = get_events_split_by_date(target_year, cache_dir=cache_dir)
 
-    Returns a dictionary with future race forecasts and explainable summaries.
-    """
-    completed_2026, future_2026 = get_events_split_by_date(target_year, cache_dir=cache_dir)
-
-    if completed_2026.empty:
-        return {
-            "available": False,
-            "reason": "No completed 2026 races available yet for training.",
-            "future_events": [],
-            "predictions": pd.DataFrame(),
-        }
-
-    # Collect race laps from all available completed rounds in 2026.
     raw_frames = []
-    for _, ev in completed_2026.iterrows():
+
+    # Recent form: all completed races in target season.
+    for _, ev in completed_target.iterrows():
         try:
             frame = load_all_drivers_laps(
                 year=target_year,
@@ -237,12 +226,15 @@ def build_2026_all_driver_forecast(
         except Exception:
             continue
 
-    # Add lookback history (all rounds) for deeper context where available.
+    # Historical context: all prior races, or same round only for single-race mode.
     for y in range(max(2018, target_year - lookback_years), target_year):
         try:
             completed_y, _ = get_events_split_by_date(y, cache_dir=cache_dir)
         except Exception:
             continue
+
+        if focus_round is not None and "RoundNumber" in completed_y.columns:
+            completed_y = completed_y[completed_y["RoundNumber"] == focus_round].copy()
 
         for _, ev in completed_y.iterrows():
             try:
@@ -256,22 +248,25 @@ def build_2026_all_driver_forecast(
             except Exception:
                 continue
 
-    if not raw_frames:
-        return {
-            "available": False,
-            "reason": "Could not load race data required for forecasting.",
-            "future_events": [],
-            "predictions": pd.DataFrame(),
-        }
+    raw_all = pd.concat(raw_frames, ignore_index=True, sort=False) if raw_frames else pd.DataFrame()
+    return raw_all, completed_target, future_target
 
-    raw_all = pd.concat(raw_frames, ignore_index=True, sort=False)
 
-    # Keep only rows with a driver code for per-driver modeling.
+def _forecast_for_events(
+    raw_all: pd.DataFrame,
+    future_events: pd.DataFrame,
+    target_year: int,
+    n_monte_carlo: int,
+) -> pd.DataFrame:
+    """Run per-driver forecast for each future event provided."""
+    if raw_all.empty or future_events.empty:
+        return pd.DataFrame()
+
     raw_all = raw_all[raw_all.get("Driver").notna()].copy()
     drivers = sorted(raw_all["Driver"].dropna().astype(str).unique().tolist())
 
     forecasts = []
-    for future_event in future_2026.itertuples(index=False):
+    for future_event in future_events.itertuples(index=False):
         future_round = int(getattr(future_event, "RoundNumber"))
         future_name = str(getattr(future_event, "EventName"))
 
@@ -285,7 +280,6 @@ def build_2026_all_driver_forecast(
                 driver_feat = add_rolling_features(driver_clean, rolling_window=3)
                 driver_feat = add_historical_features(driver_feat, target_year=target_year)
 
-                # Train with all known data for this driver and evaluate on 2026 rows.
                 result = train_and_evaluate(
                     driver_feat,
                     model_kind="random_forest",
@@ -332,20 +326,14 @@ def build_2026_all_driver_forecast(
             except Exception:
                 continue
 
-    forecast_df = pd.DataFrame(forecasts)
-    if forecast_df.empty:
-        return {
-            "available": False,
-            "reason": "Forecasting ran but produced no valid driver predictions.",
-            "future_events": future_2026["EventName"].dropna().tolist(),
-            "predictions": pd.DataFrame(),
-        }
+    if not forecasts:
+        return pd.DataFrame()
 
+    forecast_df = pd.DataFrame(forecasts)
     forecast_df = _add_probability_outcomes(forecast_df, n_sims=n_monte_carlo)
 
-    # Convert predicted lap pace into a simple race-strength score per event.
     event_tables = []
-    for event_name, g in forecast_df.groupby("EventName"):
+    for _, g in forecast_df.groupby("EventName"):
         t = g.sort_values("ExpectedAvgLapTimeSec").reset_index(drop=True)
         t["PredictedRank"] = np.arange(1, len(t) + 1)
         event_tables.append(t)
@@ -354,9 +342,133 @@ def build_2026_all_driver_forecast(
     if "_SimAvgLapSamples" in forecast_df.columns:
         forecast_df = forecast_df.drop(columns=["_SimAvgLapSamples"])
 
+    return forecast_df
+
+
+def build_2026_all_driver_forecast(
+    cache_dir: str,
+    target_year: int = 2026,
+    lookback_years: int = 5,
+    n_monte_carlo: int = 250,
+) -> dict[str, Any]:
+    """
+    Train on all available prior race data and predict all-driver future races.
+
+    Returns a dictionary with future race forecasts and explainable summaries.
+    """
+    raw_all, completed_2026, future_2026 = _collect_training_raw(
+        cache_dir=cache_dir,
+        target_year=target_year,
+        lookback_years=lookback_years,
+        focus_round=None,
+    )
+
+    if completed_2026.empty:
+        return {
+            "available": False,
+            "reason": "No completed 2026 races available yet for training.",
+            "future_events": [],
+            "predictions": pd.DataFrame(),
+        }
+
+    if raw_all.empty:
+        return {
+            "available": False,
+            "reason": "Could not load race data required for forecasting.",
+            "future_events": [],
+            "predictions": pd.DataFrame(),
+        }
+
+    forecast_df = _forecast_for_events(
+        raw_all=raw_all,
+        future_events=future_2026,
+        target_year=target_year,
+        n_monte_carlo=n_monte_carlo,
+    )
+    if forecast_df.empty:
+        return {
+            "available": False,
+            "reason": "Forecasting ran but produced no valid driver predictions.",
+            "future_events": future_2026["EventName"].dropna().tolist(),
+            "predictions": pd.DataFrame(),
+        }
+
     return {
         "available": True,
         "reason": "ok",
         "future_events": future_2026["EventName"].dropna().astype(str).tolist(),
+        "predictions": forecast_df,
+    }
+
+
+def build_2026_single_race_forecast(
+    cache_dir: str,
+    race_name: str,
+    target_year: int = 2026,
+    lookback_years: int = 5,
+    n_monte_carlo: int = 250,
+) -> dict[str, Any]:
+    """Forecast one selected 2026 future race for all drivers."""
+    _, _, future_2026 = _collect_training_raw(
+        cache_dir=cache_dir,
+        target_year=target_year,
+        lookback_years=lookback_years,
+        focus_round=None,
+    )
+
+    if future_2026.empty:
+        return {
+            "available": False,
+            "reason": "No future races found for the selected season.",
+            "future_events": [],
+            "predictions": pd.DataFrame(),
+        }
+
+    target_events = future_2026[
+        future_2026["EventName"].astype(str).str.lower() == str(race_name).lower()
+    ].copy()
+    if target_events.empty:
+        return {
+            "available": False,
+            "reason": f"Race '{race_name}' not found in future {target_year} events.",
+            "future_events": future_2026["EventName"].dropna().astype(str).tolist(),
+            "predictions": pd.DataFrame(),
+        }
+
+    target_round = int(target_events.iloc[0]["RoundNumber"])
+    raw_all, completed_2026, _ = _collect_training_raw(
+        cache_dir=cache_dir,
+        target_year=target_year,
+        lookback_years=lookback_years,
+        focus_round=target_round,
+    )
+
+    if completed_2026.empty or raw_all.empty:
+        return {
+            "available": False,
+            "reason": "Insufficient training races available for single-race forecasting.",
+            "future_events": [str(target_events.iloc[0]["EventName"])],
+            "predictions": pd.DataFrame(),
+        }
+
+    forecast_df = _forecast_for_events(
+        raw_all=raw_all,
+        future_events=target_events,
+        target_year=target_year,
+        n_monte_carlo=n_monte_carlo,
+    )
+
+    if forecast_df.empty:
+        return {
+            "available": False,
+            "reason": "Single-race forecasting ran but produced no valid driver predictions.",
+            "future_events": [str(target_events.iloc[0]["EventName"])],
+            "predictions": pd.DataFrame(),
+        }
+
+    return {
+        "available": True,
+        "reason": "ok",
+        "future_events": [str(target_events.iloc[0]["EventName"])],
         "predictions": forecast_df,
     }

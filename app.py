@@ -10,7 +10,7 @@ import pandas as pd
 import streamlit as st
 
 from data_pipeline import PipelineConfig, build_modeling_frame, get_event_names
-from future_forecast import build_2026_all_driver_forecast
+from future_forecast import build_2026_all_driver_forecast, build_2026_single_race_forecast
 from model import build_actual_vs_pred_plot, get_feature_importance_table, train_and_evaluate
 
 
@@ -364,6 +364,14 @@ else:
     selected_gp = st.sidebar.text_input("Grand Prix Name", value="Bahrain Grand Prix")
 
 run_button = st.sidebar.button("Run Analysis", use_container_width=True)
+future_scope = st.sidebar.selectbox(
+    "2026 Forecast Scope",
+    options=["All Future Races", "Single Future Race"],
+)
+future_race_name = st.sidebar.text_input(
+    "Single Future Race Name (exact)",
+    value="Abu Dhabi Grand Prix",
+)
 run_future_button = st.sidebar.button("Run 2026 All-Driver Forecast", use_container_width=True)
 
 if run_button:
@@ -542,19 +550,31 @@ if run_future_button:
     )
 
     with st.spinner("Building all-driver forecast for future 2026 races..."):
-        forecast_result = build_2026_all_driver_forecast(
-            cache_dir=cache_dir,
-            target_year=2026,
-            lookback_years=max(1, int(history_years) + 2),
-            n_monte_carlo=400,
-        )
+        if future_scope == "Single Future Race":
+            forecast_result = build_2026_single_race_forecast(
+                cache_dir=cache_dir,
+                race_name=future_race_name,
+                target_year=2026,
+                lookback_years=max(1, int(history_years) + 2),
+                n_monte_carlo=400,
+            )
+        else:
+            forecast_result = build_2026_all_driver_forecast(
+                cache_dir=cache_dir,
+                target_year=2026,
+                lookback_years=max(1, int(history_years) + 2),
+                n_monte_carlo=400,
+            )
 
     if not forecast_result.get("available"):
         st.warning(forecast_result.get("reason", "Forecast unavailable."))
     else:
         pred = forecast_result["predictions"].copy()
         events = forecast_result.get("future_events", [])
-        st.success(f"Generated AI predictions for {len(events)} upcoming 2026 race(s).")
+        if future_scope == "Single Future Race":
+            st.success("Generated AI single-race prediction using recent form + same-track history.")
+        else:
+            st.success(f"Generated AI predictions for {len(events)} upcoming 2026 race(s).")
 
         event_choice = st.selectbox(
             "Select Future Race",

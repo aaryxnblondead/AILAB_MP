@@ -414,7 +414,12 @@ if run_button:
             if "SeasonYear" in model_df.columns
             else [int(selected_year)]
         )
-        st.caption(f"AI trained with seasons: {', '.join(map(str, seasons_used))}")
+        requested_history = int(history_years)
+        loaded_history = max(0, len(seasons_used) - 1)
+        st.caption(
+            f"AI trained with seasons: {', '.join(map(str, seasons_used))} "
+            f"(requested historical seasons: {requested_history}, loaded: {loaded_history})"
+        )
 
         st.subheader("Actual vs Predicted Lap Times")
         st.pyplot(fig, clear_figure=True)

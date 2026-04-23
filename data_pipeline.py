@@ -389,6 +389,63 @@ def get_event_names(
     return race_schedule["EventName"].dropna().astype(str).drop_duplicates().tolist()
 
 
+def _resolve_equivalent_event_name(
+    source_event: pd.Series,
+    target_year: int,
+    cache_dir: str,
+) -> str | None:
+    """Resolve equivalent race event in another season by name/location fallback."""
+    enable_fastf1_cache(cache_dir)
+    schedule = fastf1.get_event_schedule(target_year).copy()
+    if schedule.empty or "EventName" not in schedule.columns:
+        return None
+
+    if "Session5" in schedule.columns:
+        schedule = schedule[schedule["Session5"] == "Race"].copy()
+    if schedule.empty:
+        return None
+
+    source_name = str(source_event.get("EventName", "")).strip()
+    source_location = str(source_event.get("Location", "")).strip().lower()
+    source_country = str(source_event.get("Country", "")).strip().lower()
+
+    # 1) Exact event name match.
+    exact = schedule[schedule["EventName"].astype(str).str.lower() == source_name.lower()]
+    if not exact.empty:
+        return str(exact.iloc[0]["EventName"])
+
+    # 2) Location match (track/city-level) when available.
+    if "Location" in schedule.columns and source_location:
+        by_loc = schedule[
+            schedule["Location"].astype(str).str.strip().str.lower() == source_location
+        ]
+        if not by_loc.empty:
+            return str(by_loc.iloc[0]["EventName"])
+
+    # 3) Country fallback.
+    if "Country" in schedule.columns and source_country:
+        by_country = schedule[
+            schedule["Country"].astype(str).str.strip().str.lower() == source_country
+        ]
+        if not by_country.empty:
+            return str(by_country.iloc[0]["EventName"])
+
+    # 4) Token-overlap fallback for naming changes.
+    source_tokens = [t for t in source_name.lower().replace("grand prix", "").split() if t]
+    if source_tokens:
+        scores = []
+        for _, row in schedule.iterrows():
+            name = str(row["EventName"]).lower()
+            score = sum(1 for tok in source_tokens if tok in name)
+            scores.append(score)
+        schedule = schedule.assign(_match_score=scores)
+        schedule = schedule.sort_values("_match_score", ascending=False)
+        if not schedule.empty and int(schedule.iloc[0]["_match_score"]) > 0:
+            return str(schedule.iloc[0]["EventName"])
+
+    return None
+
+
 def build_modeling_frame(
     year: int,
     grand_prix: str,
@@ -398,8 +455,9 @@ def build_modeling_frame(
     """End-to-end data assembly for downstream modeling."""
     enable_fastf1_cache(config.cache_dir)
 
-    # Resolve round number for current selection, then backfill previous seasons
-    # using the same round to approximate the same circuit context.
+    # Resolve the selected event, then backfill previous seasons using equivalent
+    # event/track matching. Round numbers vary by season, so round-only matching
+    # can miss valid historical races.
     event = fastf1.get_event(year, grand_prix)
     round_number = int(event["RoundNumber"])
 
@@ -418,12 +476,21 @@ def build_modeling_frame(
         if prev_year < 2018:
             continue
         try:
-            prev_raw = _safe_load_driver_laps_for_round(
+            prev_event_name = _resolve_equivalent_event_name(
+                source_event=event,
+                target_year=prev_year,
+                cache_dir=config.cache_dir,
+            )
+            if not prev_event_name:
+                continue
+
+            prev_raw = load_driver_laps(
                 year=prev_year,
-                round_number=round_number,
+                grand_prix=prev_event_name,
                 driver=driver,
                 cache_dir=config.cache_dir,
             )
+            prev_raw["SeasonYear"] = int(prev_year)
             frames.append(prev_raw)
         except Exception:
             # Historical coverage may be incomplete; skip unavailable seasons.
